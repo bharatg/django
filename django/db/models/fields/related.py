@@ -4,7 +4,7 @@ from functools import partial
 
 from django import forms
 from django.apps import apps
-from django.conf import SettingsReference
+from django.conf import SettingsReference, settings
 from django.core import checks, exceptions
 from django.db import connection, router
 from django.db.backends import utils
@@ -616,21 +616,19 @@ class ForeignObject(RelatedField):
             related_fields.append((from_field, to_field))
         return related_fields
 
-    @property
+    @cached_property
     def related_fields(self):
-        if not hasattr(self, '_related_fields'):
-            self._related_fields = self.resolve_related_fields()
-        return self._related_fields
+        return self.resolve_related_fields()
 
-    @property
+    @cached_property
     def reverse_related_fields(self):
         return [(rhs_field, lhs_field) for lhs_field, rhs_field in self.related_fields]
 
-    @property
+    @cached_property
     def local_related_fields(self):
         return tuple(lhs_field for lhs_field, rhs_field in self.related_fields)
 
-    @property
+    @cached_property
     def foreign_related_fields(self):
         return tuple(rhs_field for lhs_field, rhs_field in self.related_fields if rhs_field)
 
@@ -923,6 +921,21 @@ class ForeignKey(ForeignObject):
                 },  # 'pk' is included for backwards compatibility
             )
 
+    def resolve_related_fields(self):
+        related_fields = super().resolve_related_fields()
+        for from_field, to_field in related_fields:
+            if to_field and to_field.model != self.remote_field.model._meta.concrete_model:
+                raise exceptions.FieldError(
+                    "'%s.%s' refers to field '%s' which is not local to model "
+                    "'%s'." % (
+                        self.model._meta.label,
+                        self.name,
+                        to_field.name,
+                        self.remote_field.model._meta.concrete_model._meta.label,
+                    )
+                )
+        return related_fields
+
     def get_attname(self):
         return '%s_id' % self.name
 
@@ -967,6 +980,7 @@ class ForeignKey(ForeignObject):
             'queryset': self.remote_field.model._default_manager.using(using),
             'to_field_name': self.remote_field.field_name,
             **kwargs,
+            'blank': self.blank,
         })
 
     def db_check(self, connection):
@@ -1422,12 +1436,23 @@ class ManyToManyField(RelatedField):
                 clashing_obj = '%s.%s' % (opts.label, _get_field_name(model))
             else:
                 clashing_obj = model._meta.label
+            if settings.DATABASE_ROUTERS:
+                error_class, error_id = checks.Warning, 'fields.W344'
+                error_hint = (
+                    'You have configured settings.DATABASE_ROUTERS. Verify '
+                    'that the table of %r is correctly routed to a separate '
+                    'database.' % clashing_obj
+                )
+            else:
+                error_class, error_id = checks.Error, 'fields.E340'
+                error_hint = None
             return [
-                checks.Error(
+                error_class(
                     "The field's intermediary table '%s' clashes with the "
                     "table name of '%s'." % (m2m_db_table, clashing_obj),
                     obj=self,
-                    id='fields.E340',
+                    hint=error_hint,
+                    id=error_id,
                 )
             ]
         return []
